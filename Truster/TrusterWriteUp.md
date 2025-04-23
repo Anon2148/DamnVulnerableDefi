@@ -56,3 +56,50 @@ Este token será inicializado en el constructor de nuestro contrato `TrusterLend
 ![TrsuterLenderPool contract](https://github.com/user-attachments/assets/02ec37b3-652d-4c86-a5f4-c4349e689de6)
 
 # Vulnerabilidad/es
+
+Como en este contrato solo consta de una función con la que podemos interactuar, vamos a centrar nuestro análisis en esa función, si nos fijamos en la imagen de arriba y vamos analizando línea por línea la función obtenemos lo siguiente:
+
+>[!important]
+>**Función `flashLoan()`**
+>
+>- `uint256 balanceBefore = token.balanceOf(address(this));`: Esta línea devolverá el balance de tokens de la dirección de la pool actual.
+>- `token.transfer(borrower, amount);`: Esta línea modificará el contrato token asignando la cantidad de tokens `amount` a la dirección asignada en `borrower`.
+>- `target.functionCall(data);`: Esta línea ejecutará una llamada `call` a la función pasada en la variable `data`.
+>- `if (token.balanceOf(address(this)) < balanceBefore) {...}`: Esta sentencia if comprobará si el balance en el instante actual es el mismo que el que teniamos al inicio de la ejecución de la función.
+
+Con esto podemos concluir que se nos transfieren una cantidad de tokens determinada, podemos ejecutar una función con `call` y por último debemos devolver los tokens prestados. Sin embargo hay varios problemas de seguridad en esta función.
+
+>[!warning]
+>1. No comprobamos que la cantidad que se transfiere sea mayor que la cantidad de tokens de la pool, aunque si intentamos transferir más tokens de los existentes la función transfer revertirá por _underflow_ (versión de solidity >= 0.8.x)
+>2. No se comprueba que contiene la variable `data`, esto es una vulnerabilidad muy grave ya que se puede ejecutar funciones privilegiadas en nombre de la pool.
+>3. No comprobamos el `target` que se pasa por parámetro, si pasamos una dirección que pueda interactuar con el contrato de tokens sin restricciones podremos ejecutar funciones privilegiadas.
+
+El contrato permite una llamada arbitraria en su propio nombre, **sin restricciones**, lo que puede usarse para alterar permisos (`approve`) de otras cuentas (como la de un atacante) sin cambiar el balance de los tokens y por eso el chequeo `balanceBefore` pasa, aunque el control del dinero ya se haya perdido. Vamos a pasar a la creación de nuestro contrato atacante donde se verá más claro la explotación de la vulnerabilidad.
+
+# Exploit
+
+El exploit se encuentra en el archivo `TrusterLenderPoolAttacker.sol`, vamos a explicar la función principal que ejecutará el ataque. La función sería la siguiente:
+
+![attack function](https://github.com/user-attachments/assets/92b864ac-391a-47d6-9a03-58fe5b74825c)
+
+Como podemos ver llamamos a la función `flashLoan()` con un amount de 0 para que pase el check final, como `borrower` el contrato atacante, como `target` el contrato `token` y como `data` le pasamos la función `approve` con la dirección del contrato que va a trasnferir los tokens, este caso el contrato atacante, y el balance total de la _pool_ que es el contrato del que queremos conseguir los tokens.
+
+**De forma más resumida, como podemos ejecutar cualquier función que queramos a través del contrato de la _pool_, vamos a ejecutar la función `approve` para dar permiso al contrato atacante a transferir una cantidad de tokens, para luego transferir los tokens de la _pool_ hacia la cuenta recovery y así vaciar la pool.**
+
+Por lo tanto el test de foundry para probar nuestro exploit quedaría de la siguiente forma:
+
+![foundry test](https://github.com/user-attachments/assets/e343efd4-b3c7-46f8-914b-64f22a913a85)
+
+Solo debemos inicializar(desplegar en un caso real) el contrato y llamar a la función del contrato que se encargará de todo, después de la ejecución todos los tokens pasarán a la dirección `recovery` asignada en el constructor.
+
+Si ejecutamos el siguiente comando dentro del proyecto podremos comprobar que nuestro exploit funciona correctamente:
+
+```bash
+forge test --mp test/truster/Truster.t.sol
+```
+
+![terminal test pass](https://github.com/user-attachments/assets/fd750f38-5d73-4a12-8d07-98daebe7198b)
+
+Hemos conseguido vulnerar este contrato consiguiendo vaciar la pool y transferir los fondos a la cuenta recovery, así demostramos que es bastante importante aplicar buenas prácticas en nuestro código como la validación en la entrada del usuario así como la dirección que puede aprobar la transferencia de tokens hacia direcciones confiables. También debemos tener en cuenta las dependencias de las que hace uso nuestro contrato porque pueden suponer riesgos de seguridad abriendo la posibilidad de ataques.
+
+Happy Hacking ;)
