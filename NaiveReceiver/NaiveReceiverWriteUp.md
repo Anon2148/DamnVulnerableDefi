@@ -61,3 +61,37 @@ Por otro lado tenemos la función `execute()`:
 ![execute function](https://github.com/user-attachments/assets/f3ebc151-7d2e-4a2f-8388-ab839d60bd3a)
 
 Esta función ejecutará primero la función `checkRequest()` mencionada anteriormente, para después inicializar las variables que se usarán en el `call` para ejecutar la request. Como vemos al crear el payload se concatena la dirección que hayamos puesto en el campo `from` que debe coincidir con el firmante de la request.
+
+## Contrato `Multicall.sol`
+
+Este contrato es abstracto y solo contiene una única función la cual se encarga de agrupar multiples llamadas en una sola transacción, además estas llamadas se realizan con la función `delegateCall`, la cual ejecuta código de un contrato en el contexto del contrato que lo ha llamado (mismo msg.value y msg.data).
+
+![multicall contract](https://github.com/user-attachments/assets/489af55b-83d6-4e18-a060-442093954c52)
+
+# Análisis de vulnerabilidades
+
+Con este análisis breve vamos a buscar posibles vulnerabilidades que puedan existir para conseguir nuestro objetivo que es drenar el contrato `BasicForwarder.sol` y `NaiveReceiverPool.sol`, vamos a empezar con el primero mencionado. Para ello nos tenemos que fijar en la función `onFlashLoan()` la cual se ejecutará cuando el usuario del contrato llame a la función `flashLoan()` de la _pool_.
+
+![key part receiver flash loan](https://github.com/user-attachments/assets/6a9c218e-af9f-45d4-a141-b38cba6ffd71)
+
+Esta parte de la función calcula la cantidad de _fee_ que debe pagar el usuario que utilice la flash loan, en este caso 1 WETH, junto a la cantidad de WETH pedida en el flash loan. A continuación, se ejecuta una función vacía que no afecta al valor del token y por último se aprueba el pago de la _fee_ a la pool. Como podemos comprobar este contrato no realiza ninguna acción adicional con los tokens prestados **ni comprueba si ha recibido 0 tokens WETH**, pero paga el _fee_ para que la transacción no revierta. Si conseguimos de alguna forma llamar suficientes veces al contrato de la _pool_ y designamos al recibidor de los tokens como la dirección del contrato `FlashLoanReceiver.sol` con una cantidad de 0 tokens WETH vamos a conseguir drenar los tokens del contrato que serán destinados a la dirección del _fee receiver_ la cual comentamos en el constructor de la _pool_.
+
+Una forma de hacer esto sería con la función `multicall`, esta función es perfecta para este propósito ya que podemos ejecutar una determinada función un número de veces determinado, como en el contrato `FlashLoanReceiver.sol` hay depositados 10 WETH, podemos crear un array de 10 posiciones donde cada posición tenga una llamada a `flashLoan()` donde el recibidor sea el contrato que queremos drenar, esto se verá con más detalle en la parte del exploit.
+
+Digamos que el ataque anterior fuese exitoso, ahora en la _pool_ habría 1010 tokens WETH los cuáles tenemos que obtener, vamos a ver posibles vías de explotación.
+
+> [!CAUTION]
+> Vía 1 BasicForwarder + función withdraw (la que yo tomé inicialmente):
+>
+> Después de un rato estudiando los contratos, se me ocurrión una forma de intentar drenar la _pool_. Como hemos visto en el análisis, tenemos un contrato que realiza meta-transacciones firmadas donde nos podemos ahorrar pagar el gas, además que tenemos una función `withdraw` en el contrato de la _pool_ que si es llamada por el contrato `BasicForwarder.sol` no devuelve la dirección del `msg.sender` sino la dirección que haya en los últimos 20 bytes del `msg.data`. Por lo que en teoría si yo manipulaba el `msg.data` para que la dirección de la que se iban a retirar los fondos fuera la de la _pool_ ya habría conseguido mi objetivo.
+>
+> ![_msgSender](https://github.com/user-attachments/assets/a0a978a5-e5d6-4970-b6ac-343c27e95f9d)
+>
+> Fui a probarlo pero me fallaba todas las veces, daba igual que cambiase que siempre fallaba el test, incluso estuve _debuggeando_ manualmente el contrato para ver que me estaba devolviendo la función de arriba y descubrí que mi idea inicial no era correcta, dicha función siempre me devolvía la dirección del creador de la _request_ que en este caso era mí dirección como atacante (player) la cual no tenía fondos, por lo que el test intentaba retirar fondos de una cuenta sin fondos y por eso revertía la transacción. Esto pasaba porque en la función `execute` del contrato que ofrecía las meta-transacciones siempre se concatenaba al final del payload de la llamada la dirección del firmante de la request invalidando mi ataque.
+
+> [!TIP]
+> Vía 2 BasicForwarder + Multicall + función withdraw
+>
+> Esta solución es algo más compleja pero es la forma correcta de drenar la _pool_.
+
+
