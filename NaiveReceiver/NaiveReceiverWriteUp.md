@@ -1,6 +1,6 @@
 # Introducción
 
-Este reporte se ha realizado sobre uno de los retos que podemos encontrar en la plataforma online [Damn Vulnerable DeFi](https://www.damnvulnerabledefi.xyz/) llamado [Unstoppable](https://www.damnvulnerabledefi.xyz/challenges/naive-receiver/). Las instruciones del reto se pueden consultar en la siguiente imagen:
+Este reporte se ha realizado sobre uno de los retos que podemos encontrar en la plataforma online [Damn Vulnerable DeFi](https://www.damnvulnerabledefi.xyz/) llamado [Naive Receiver](https://www.damnvulnerabledefi.xyz/challenges/naive-receiver/). Las instruciones del reto se pueden consultar en la siguiente imagen:
 
 ![naive receiver instructions](https://github.com/user-attachments/assets/4f96c6d8-9714-41ee-93a5-80e0a1da29b8)
 
@@ -83,15 +83,57 @@ Digamos que el ataque anterior fuese exitoso, ahora en la _pool_ habría 1010 to
 > [!CAUTION]
 > Vía 1 BasicForwarder + función withdraw (la que yo tomé inicialmente):
 >
-> Después de un rato estudiando los contratos, se me ocurrión una forma de intentar drenar la _pool_. Como hemos visto en el análisis, tenemos un contrato que realiza meta-transacciones firmadas donde nos podemos ahorrar pagar el gas, además que tenemos una función `withdraw` en el contrato de la _pool_ que si es llamada por el contrato `BasicForwarder.sol` no devuelve la dirección del `msg.sender` sino la dirección que haya en los últimos 20 bytes del `msg.data`. Por lo que en teoría si yo manipulaba el `msg.data` para que la dirección de la que se iban a retirar los fondos fuera la de la _pool_ ya habría conseguido mi objetivo.
+> Después de un rato estudiando los contratos, se me ocurrió una forma de intentar drenar la _pool_. Como hemos visto en el análisis, tenemos un contrato que realiza meta-transacciones firmadas donde nos podemos ahorrar pagar el gas, además que tenemos una función `withdraw` en el contrato de la _pool_ que si es llamada por el contrato `BasicForwarder.sol` no devuelve la dirección del `msg.sender` sino la dirección que haya en los últimos 20 bytes del `msg.data`. Por lo que en teoría si yo manipulaba el `msg.data` para que la dirección de la que se iban a retirar los fondos fuera la de la _pool_ ya habría conseguido mi objetivo.
 >
 > ![_msgSender](https://github.com/user-attachments/assets/a0a978a5-e5d6-4970-b6ac-343c27e95f9d)
 >
 > Fui a probarlo pero me fallaba todas las veces, daba igual que cambiase que siempre fallaba el test, incluso estuve _debuggeando_ manualmente el contrato para ver que me estaba devolviendo la función de arriba y descubrí que mi idea inicial no era correcta, dicha función siempre me devolvía la dirección del creador de la _request_ que en este caso era mí dirección como atacante (player) la cual no tenía fondos, por lo que el test intentaba retirar fondos de una cuenta sin fondos y por eso revertía la transacción. Esto pasaba porque en la función `execute` del contrato que ofrecía las meta-transacciones siempre se concatenaba al final del payload de la llamada la dirección del firmante de la request invalidando mi ataque.
+> ![from address appended to payload](https://github.com/user-attachments/assets/77154dd2-5e54-4ab7-a618-c1c1f4f3e809)
+
 
 > [!TIP]
 > Vía 2 BasicForwarder + Multicall + función withdraw
 >
-> Esta solución es algo más compleja pero es la forma correcta de drenar la _pool_.
+> Esta solución es algo más compleja pero es la forma correcta de drenar la _pool_. Como hemos visto, llamar a `withdraw` directamente no funciona ya que aunque el `msg.sender` sea el Basic Forwarder la dirección de los últimos 20 bytes será la del player la cual no tiene fondos. Bien, por lo tanto una vía alternativa es usar la función multicall ya que la pool hereda este contrato. Como sabemos al hacer una request podemos pasarle el `payload` que queramos que la request ejecute en un contrato específico, por lo tanto nosotros podemos crear un payload que llame a la función multicall con `withdraw` concatenando la dirección del deployer al final. Esto es posible debido a que multicall utiliza la función `delegateCall` para las llamadas, la particularidad de esta llamada es que mantiene el `msg.sender` original (en nuestro caso del basic forwarder) pero el payload puede ser distinto (dirección del deployer al final). Con esto conseguimos _bypassear_ la restricción de la función `_msgSender()` y drenar la pool
 
+Es comprensible que no se entienda a priori toda esta explicación (a mi me costó al principio, además que lo conseguí con ayuda jeje), pero vamos a verlo en código para dejarlo todo más claro.
 
+# Test de foundry
+
+Para corroborar la explicación anterior hemos completado el test de foundry del reto de la siguiente manera: El ataque se podría dividir en dos pasos haciendo dos transacciones (que es lo máximo que te permite el reto) para simplificarlo, pero he optado por una versión algo más reducida que completa el ataque en una transacción.
+
+## Parte 1
+
+Creación del array de bytes que va a contener las llamadas a la función `multicall`.
+
+![part 1 10 calls to flashloan](https://github.com/user-attachments/assets/08f99e3d-8ec8-4598-a7f7-781431841754)
+
+Como vemos hemos creado un array de 11 espacios y los 10 primeros espacios serán las 10 llamadas que se harán a la función flashLoan donde el recibidor será `FlashLoanReceiver.sol`, después de estas diez ejecuciones, la _pool_ tendrá 1010 tokens WETH.
+
+## Parte 2
+
+Creación del payload que va a drenar la _pool_.
+
+![part 2 withdraw payload](https://github.com/user-attachments/assets/fc703f5e-6c4e-4ac2-966c-a5e2511ed6e8)
+
+Como podemos observar, vamos a añadir en el último espacio del array el payload que llamará a `withdraw` desde el basic forwarder añadiendo al final la dirección del deployer que es la dirección que tiene todos los tokens asignados de la _pool_.
+
+## Unión parte 1 + parte 2 con BasicForwarder
+
+Creación de la request que se enviará a ejecutar al Basic Forwarder.
+
+![part 3 basic forwarder request](https://github.com/user-attachments/assets/6a1b9609-4d88-45d1-b6bf-d22cd5bf96e1)
+
+Por último tenemos que crear el payload donde la dirección de `from` será la del player y el target la _pool_. Los datos van a ser la llamada a multicall codificada donde le pasamos el array anterior con todas las llamadas. El contrato Basic Forwarder nos obliga a firmar la request con una clave, como la única clave disponible que tenemos es la del player, solo podemos usar esa para firmar evitando así que la ejecución no revierta.
+
+Para comprobar el resultado de nuestro ataque basta con ejecutar el siguiente comando
+
+```bash
+forge test --mp test/naive-receiver/NaiveReceiver.t.sol
+```
+
+El test pasa y el reto estaría completado.
+
+![terminal output](https://github.com/user-attachments/assets/14004b10-20c1-401b-a80e-7b859bcc5bb9)
+
+En este reto hemos podido explorar como un contrato que no realiza comprobaciones de seguridad al recibir flash loan puede ser drenado si se pagan fees muy altas, además de un fallo crítico a la hora de integrar otras funcionalidades en nuestro contrato de _pool_ que pueden no parecer vulnerables pero que con paciencia y análisis se consiguen encontrar puntos de fallo. Este ha sido uno de los retos más complicados que he experimentado.
